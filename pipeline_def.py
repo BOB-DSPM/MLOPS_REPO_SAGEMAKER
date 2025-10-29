@@ -10,17 +10,22 @@ from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.parameters import (
     ParameterString, ParameterFloat, ParameterInteger,
 )
-from sagemaker.workflow.steps import CacheConfig, ProcessingStep, TrainingStep
+from sagemaker.workflow.steps import (
+    CacheConfig, ProcessingStep, TrainingStep,
+    CreateModelStep, EndpointConfigStep, EndpointStep,  # ✅ 배포 단계 추가
+)
 from sagemaker.workflow.step_collections import RegisterModel
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.functions import Join
 from sagemaker.workflow.condition_step import ConditionStep, JsonGet
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
+from sagemaker.workflow.execution_variables import ExecutionVariables  # ✅ 실행 ID 사용
 from sagemaker.processing import ScriptProcessor, ProcessingInput, ProcessingOutput
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
 from sagemaker import image_uris
+from sagemaker.model import Model as SmModel  # ✅ CreateModelStep에 사용
 from sagemaker.workflow.pipeline_context import PipelineSession
 
 
@@ -131,21 +136,21 @@ def _ensure_scripts_in_s3(s3_client, bucket: str, base_dir: str) -> dict:
 def get_pipeline(region: str, role: str) -> Pipeline:
     sm_sess = PipelineSession()
 
-    # CDK가 CodeBuild에 주입하는 환경변수와 이름을 일치시킴
-    # (DATA_BUCKET, SM_INSTANCE_TYPE, TRAIN_IMAGE_URI, EXTERNAL_CSV_URI, FEATURE_GROUP_NAME, MODEL_PACKAGE_GROUP_NAME)
-    p_data_bucket  = ParameterString("DataBucket",  default_value=os.environ.get("DATA_BUCKET", ""))
-    p_prefix       = ParameterString("Prefix",      default_value=os.environ.get("PREFIX", "pipelines/exp1"))
-    p_instance_type= ParameterString("InstanceType",default_value=os.environ.get("SM_INSTANCE_TYPE", "ml.m5.large"))
+    # CDK/CodePipeline 파라미터와 이름을 일치
+    p_data_bucket   = ParameterString("DataBucket",        default_value=os.environ.get("DATA_BUCKET", ""))
+    p_prefix        = ParameterString("Prefix",            default_value=os.environ.get("PREFIX", "pipelines/exp1"))
+    p_instance_type = ParameterString("InstanceType",      default_value=os.environ.get("SM_INSTANCE_TYPE", "ml.m5.large"))
+    p_endpoint_name = ParameterString("EndpointName",      default_value=os.environ.get("SM_ENDPOINT_NAME", "mlops-endpoint"))  # ✅ 추가
 
     default_train_image = image_uris.retrieve(framework="xgboost", region=sm_sess.boto_region_name, version="1.7-1")
-    p_train_image  = ParameterString("TrainImage",  default_value=os.environ.get("TRAIN_IMAGE_URI", default_train_image))
-    p_external_csv = ParameterString("ExternalCsvUri", default_value=os.environ.get("EXTERNAL_CSV_URI", ""))
-    p_use_fs       = ParameterString("UseFeatureStore", default_value=os.environ.get("USE_FEATURE_STORE", "true"))
-    p_fg_name      = ParameterString("FeatureGroupName", default_value=os.environ.get("FEATURE_GROUP_NAME", ""))
+    p_train_image  = ParameterString("TrainImage",         default_value=os.environ.get("TRAIN_IMAGE_URI", default_train_image))
+    p_external_csv = ParameterString("ExternalCsvUri",     default_value=os.environ.get("EXTERNAL_CSV_URI", ""))
+    p_use_fs       = ParameterString("UseFeatureStore",    default_value=os.environ.get("USE_FEATURE_STORE", "false"))
+    p_fg_name      = ParameterString("FeatureGroupName",   default_value=os.environ.get("FEATURE_GROUP_NAME", ""))
     p_mpg          = ParameterString("ModelPackageGroupName", default_value=os.environ.get("MODEL_PACKAGE_GROUP_NAME", "model-pkg"))
 
-    p_auc_threshold= ParameterFloat("AucThreshold", default_value=0.65)
-    p_num_round    = ParameterInteger("NumRound", default_value=50)
+    p_auc_threshold= ParameterFloat("AucThreshold",        default_value=0.65)
+    p_num_round    = ParameterInteger("NumRound",          default_value=50)
 
     cache = CacheConfig(enable_caching=False, expire_after="PT1H")
 
@@ -306,6 +311,45 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         approval_status="PendingManualApproval",
     )
 
+    # 7) (신규) 배포 단계 — 모델 생성 → 엔드포인트 설정 → 엔드포인트 생성/업데이트
+    # 모델 이름/엔드포인트 컨피그 이름은 실행 ID와 조합하여 유일하게 생성
+    model_name = Join(on="-", values=["model", ExecutionVariables.PIPELINE_EXECUTION_ID])
+    epc_name   = Join(on="-", values=["epc",   ExecutionVariables.PIPELINE_EXECUTION_ID])
+
+    sm_model = SmModel(
+        image_uri=p_train_image,
+        model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
+        role=role,
+        name=model_name,
+        sagemaker_session=sm_sess,
+        # (필요 시 env 추가 가능)
+    )
+    create_model_step = CreateModelStep(
+        name="CreateModel",
+        model=sm_model,
+        inputs=None,
+    )
+
+    endpoint_config_step = EndpointConfigStep(
+        name="CreateEndpointConfig",
+        endpoint_config_name=epc_name,
+        production_variants=[{
+            "ModelName": create_model_step.properties.ModelName,
+            "VariantName": "AllTraffic",
+            "InitialInstanceCount": 1,
+            "InstanceType": p_instance_type,
+        }],
+        tags=[],
+    )
+
+    endpoint_step = EndpointStep(
+        name="DeployOrUpdateEndpoint",
+        endpoint_name=p_endpoint_name,
+        endpoint_config_name=endpoint_config_step.properties.EndpointConfigName,
+        update=True,  # 존재하면 UpdateEndpoint
+    )
+
+    # 품질 기준 충족 시: 모델 등록 + 배포
     cond = ConditionStep(
         name="ModelQualityCheck",
         conditions=[
@@ -314,15 +358,16 @@ def get_pipeline(region: str, role: str) -> Pipeline:
                 right=p_auc_threshold,
             )
         ],
-        if_steps=[reg],
+        if_steps=[reg, create_model_step, endpoint_config_step, endpoint_step],
         else_steps=[],
     )
 
     pipeline = Pipeline(
         name=os.environ.get("SM_PIPELINE_NAME", "my-mlops-dev-pipeline"),
         parameters=[
-            p_data_bucket, p_prefix, p_instance_type, p_train_image, p_external_csv,
-            p_use_fs, p_fg_name, p_mpg, p_auc_threshold, p_num_round,
+            p_data_bucket, p_prefix, p_instance_type, p_endpoint_name,
+            p_train_image, p_external_csv, p_use_fs, p_fg_name,
+            p_mpg, p_auc_threshold, p_num_round,
         ],
         steps=[extract_step, validate_step, preprocess_step, train_step, eval_step, cond],
         sagemaker_session=sm_sess,
@@ -330,13 +375,17 @@ def get_pipeline(region: str, role: str) -> Pipeline:
     return pipeline
 
 
-def upsert_and_start(wait: bool = False):
+def upsert_and_start(wait: bool = False, register_only: bool = False):
     region = boto3.Session().region_name
     role = os.environ["SM_EXEC_ROLE_ARN"]
     pipe = get_pipeline(region, role)
     pipe.upsert(role_arn=role)
 
-    # CodeBuild가 넣어준 env → 파라미터로 전달 (없으면 기본값 사용)
+    if register_only:
+        print("Pipeline upserted (no execution started).")
+        return
+
+    # CodeBuild/CodePipeline env → 파라미터로 전달 (없으면 기본값 사용)
     ev = os.environ
     params = {}
     if ev.get("DATA_BUCKET"):              params["DataBucket"] = ev["DATA_BUCKET"]
@@ -347,6 +396,7 @@ def upsert_and_start(wait: bool = False):
     if ev.get("MODEL_PACKAGE_GROUP_NAME"): params["ModelPackageGroupName"] = ev["MODEL_PACKAGE_GROUP_NAME"]
     if ev.get("TRAIN_IMAGE_URI"):          params["TrainImage"] = ev["TRAIN_IMAGE_URI"]
     if ev.get("SM_INSTANCE_TYPE"):         params["InstanceType"] = ev["SM_INSTANCE_TYPE"]
+    if ev.get("SM_ENDPOINT_NAME"):         params["EndpointName"] = ev["SM_ENDPOINT_NAME"]  # ✅ 추가
 
     exe = pipe.start(parameters=params if params else None)
     print("Started pipeline:", exe.arn)
@@ -367,10 +417,17 @@ def upsert_and_start(wait: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", action="store_true")
+    parser.add_argument("--run", action="store_true")          # upsert + start
     parser.add_argument("--wait", action="store_true")
+    parser.add_argument("--register", action="store_true")     # ✅ upsert만 수행
     args = parser.parse_args()
-    if args.run:
+
+    if args.register:
+        role = os.environ["SM_EXEC_ROLE_ARN"]
+        p = get_pipeline(boto3.Session().region_name, role)
+        p.upsert(role_arn=role)
+        print("Pipeline upserted (register only).")
+    elif args.run:
         upsert_and_start(wait=args.wait)
     else:
         role = os.environ["SM_EXEC_ROLE_ARN"]
