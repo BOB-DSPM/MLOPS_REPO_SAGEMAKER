@@ -3,25 +3,31 @@
 # Flow: Extract(Processing) → Train → CreateModel → Transform → Evaluate → Register
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
-import argparse, os, boto3
+import argparse
+import os
+import boto3
 
+from sagemaker import image_uris
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput, TransformInput
+from sagemaker.model import Model
+from sagemaker.model_metrics import MetricsSource, ModelMetrics
+from sagemaker.sklearn.processing import SKLearnProcessor
+from sagemaker.transformer import Transformer
+
+from sagemaker.processing import ProcessingOutput
+from sagemaker.workflow.functions import Join
 from sagemaker.workflow.parameters import (
-    ParameterString, ParameterInteger, ParameterFloat
+    ParameterString,
+    ParameterInteger,
+    ParameterFloat,
 )
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
-from sagemaker.inputs import TrainingInput, TransformInput
-from sagemaker.sklearn.processing import SKLearnProcessor
-from sagemaker.processing import ProcessingOutput
+from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
-from sagemaker.model import Model
-from sagemaker.transformer import Transformer
-from sagemaker.estimator import Estimator
-from sagemaker.workflow.properties import PropertyFile
-from sagemaker.model_metrics import MetricsSource, ModelMetrics
 from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker import image_uris
 
 
 def env_or(name: str, default: str) -> str:
@@ -40,9 +46,15 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     p_prefix = ParameterString("Prefix", default_value=env_or("PREFIX", "pipelines/exp1"))
     p_bucket = ParameterString("DataBucket", default_value=env_or("DATA_BUCKET", "my-mlops-dev-data"))
     p_use_ext_csv = ParameterString("ExternalCsvUri", default_value=env_or("EXTERNAL_CSV_URI", ""))
-    p_process_instance = ParameterString("ProcessingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
-    p_train_instance = ParameterString("TrainingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
-    p_transform_instance = ParameterString("TransformInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
+    p_process_instance = ParameterString(
+        "ProcessingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large")
+    )
+    p_train_instance = ParameterString(
+        "TrainingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large")
+    )
+    p_transform_instance = ParameterString(
+        "TransformInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large")
+    )
     p_train_max_runtime = ParameterInteger("TrainMaxRuntimeSeconds", default_value=3600)
     p_metric_auc_threshold = ParameterFloat("AUCThreshold", default_value=0.65)
 
@@ -59,14 +71,18 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         sagemaker_session=sm_sess,
         base_job_name="extract-csv",
     )
+
     step_extract = ProcessingStep(
         name="Extract",
         processor=sklearn_proc,
         code="pipelines/processing/extract.py",
         job_arguments=[
-            "--bucket", p_bucket,
-            "--prefix", p_prefix,
-            "--external-csv", p_use_ext_csv
+            "--bucket",
+            p_bucket,
+            "--prefix",
+            p_prefix,
+            "--external-csv",
+            p_use_ext_csv,
         ],
         outputs=[
             ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
@@ -74,7 +90,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         ],
     )
     train_s3 = step_extract.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri
-    val_s3   = step_extract.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri
+    val_s3 = step_extract.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri
 
     # ── Step 2: Train
     estimator = Estimator(
@@ -97,6 +113,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         colsample_bytree=0.8,
         verbosity=1,
     )
+
     train_step = TrainingStep(
         name="Train",
         estimator=estimator,
@@ -115,12 +132,13 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         role=role_arn,
         sagemaker_session=sm_sess,
     )
+
     step_create_model = ModelStep(
         name="CreateModel",
-        step_args=model.create(),   # ← create()가 CreateModel API 호출 파라미터를 반환
+        step_args=model.create(),  # ← CreateModel API 파라미터를 반환
     )
 
-    # ── Step 4: Transform (Batch inference on validation set)
+    # ── Step 4: Transform (Batch on validation set)
     transformer = Transformer(
         model_name=step_create_model.properties.ModelName,  # ✅ CreateModel 결과 사용
         instance_count=1,
@@ -129,8 +147,9 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         assemble_with="Line",
         strategy="SingleRecord",
         sagemaker_session=sm_sess,
-        output_path=None,  # 기본 S3 아웃 경로 사용(pipeline execution별 자동)
+        output_path=None,  # execution별 기본 경로
     )
+
     step_transform = TransformStep(
         name="TransformValidation",
         transformer=transformer,
@@ -138,7 +157,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
             data=val_s3,
             content_type="text/csv",
             split_type="Line",
-            input_filter="$[1:]"  # 첫 컬럼(label) 제외
+            input_filter="$[1:]",  # 첫 컬럼(label) 제외
         ),
     )
 
@@ -149,8 +168,10 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         processor=sklearn_proc,
         code="pipelines/processing/evaluate.py",
         job_arguments=[
-            "--validation-s3", val_s3,
-            "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
+            "--validation-s3",
+            val_s3,
+            "--pred-s3",
+            step_transform.properties.TransformOutput.S3OutputPath,
         ],
         outputs=[ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation")],
         property_files=[metrics_pf],
@@ -158,15 +179,26 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
 
     # ── Step 6: Register (Model Registry)
     mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
+
+    # 파이프라인 변수는 문자열 덧셈 금지 → Join 사용
+    eval_json_s3 = Join(
+        on="/",
+        values=[
+            step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
+            "evaluation.json",
+        ],
+    )
+
     model_metrics = ModelMetrics(
         model_statistics=MetricsSource(
-            s3_uri=step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json",
+            s3_uri=eval_json_s3,
             content_type="application/json",
         )
     )
+
     register_step = RegisterModel(
         name="RegisterModel",
-        estimator=estimator,  # 설명/호환 목적(이미지/환경 정의 상속)
+        estimator=estimator,  # 이미지/환경 정의 상속에 유용
         model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
         content_types=["text/csv"],
         response_types=["text/csv"],
@@ -179,9 +211,14 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     return Pipeline(
         name="SageMaker-ML-Exp1",
         parameters=[
-            p_prefix, p_bucket, p_use_ext_csv,
-            p_process_instance, p_train_instance, p_transform_instance,
-            p_train_max_runtime, p_metric_auc_threshold,
+            p_prefix,
+            p_bucket,
+            p_use_ext_csv,
+            p_process_instance,
+            p_train_instance,
+            p_transform_instance,
+            p_train_max_runtime,
+            p_metric_auc_threshold,
         ],
         steps=[step_extract, train_step, step_create_model, step_transform, step_eval, register_step],
         sagemaker_session=sm_sess,
