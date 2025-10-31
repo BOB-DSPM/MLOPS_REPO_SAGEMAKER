@@ -221,16 +221,99 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
 
 
 def upsert_and_start(wait: bool = False) -> None:
+    import time, json
     region = boto3.Session().region_name
     role = os.environ["SM_EXEC_ROLE_ARN"]
+    sm   = boto3.client("sagemaker", region_name=region)
+
     pipe = get_pipeline(region, role)
     pipe.upsert(role_arn=role)
     exe = pipe.start()
-    print("Pipeline execution started:", exe.arn)
-    if wait:
-        exe.wait()
-        print("Execution completed:", exe.describe().get("PipelineExecutionStatus"))
+    arn = exe.arn
+    print("Pipeline execution started:", arn)
 
+    if not wait:
+        print("[info] --wait 미사용: CodeBuild는 곧바로 성공 종료하고, 파이프라인은 백그라운드에서 실행됩니다.")
+        print(f"[open] 콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/pipelines/execute/{arn}")
+        return
+
+    # 수동 폴링로직 + 실패시 상세 출력
+    def _desc():
+        return sm.describe_pipeline_execution(PipelineExecutionArn=arn)
+
+    def _list_steps():
+        return sm.list_pipeline_execution_steps(PipelineExecutionArn=arn, SortOrder="Ascending")
+
+    # 대기 루프
+    while True:
+        d = _desc()
+        st = d["PipelineExecutionStatus"]
+        if st in ("Executing", "Stopping"):
+            time.sleep(20)
+            continue
+        print("[status]", st)
+        if st == "Succeeded":
+            print("Execution completed: Succeeded")
+            return
+
+        # === 실패/중단: 스텝별 원인/리소스/로그 링크 출력 ===
+        print("[error] pipeline failed. printing step diagnostics...\n")
+        steps = _list_steps().get("PipelineExecutionSteps", [])
+        for s in steps:
+            name = s.get("StepName")
+            t    = s.get("StepType")
+            st2  = s.get("StepStatus")
+            meta = s.get("Metadata", {})
+            fr   = s.get("FailureReason") or meta.get("FailureReason")
+            print(f"--- Step: {name} [{t}] => {st2}")
+            if fr:
+                print("FailureReason:", fr)
+
+            # 작업별 세부조사
+            try:
+                if t == "Processing":
+                    pj = meta.get("ProcessingJob", {}).get("Arn")
+                    if pj:
+                        jn = pj.split("/")[-1]
+                        dj = sm.describe_processing_job(ProcessingJobName=jn)
+                        print("  ProcessingJob:", jn)
+                        print("  AppLogs (CloudWatch):", dj.get("ProcessingJobArn"))
+                        print("  S3 Outputs:", json.dumps(dj.get("ProcessingOutputConfig", {}), ensure_ascii=False))
+                        print(f"  콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/processing-jobs/{jn}")
+                elif t == "Training":
+                    tj = meta.get("TrainingJob", {}).get("Arn")
+                    if tj:
+                        jn = tj.split("/")[-1]
+                        dj = sm.describe_training_job(TrainingJobName=jn)
+                        print("  TrainingJob:", jn)
+                        print("  FinalModelArtifacts:", dj.get("ModelArtifacts", {}))
+                        print(f"  콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/training-jobs/{jn}")
+                elif t == "Transform":
+                    tj = meta.get("TransformJob", {}).get("Arn")
+                    if tj:
+                        jn = tj.split("/")[-1]
+                        dj = sm.describe_transform_job(TransformJobName=jn)
+                        print("  TransformJob:", jn)
+                        print("  OutputPath:", dj.get("TransformOutput", {}))
+                        print(f"  콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/transform-jobs/{jn}")
+                elif t == "Model":
+                    mdl = meta.get("Model", {}).get("Arn")
+                    if mdl:
+                        print("  ModelArn:", mdl)
+                        mn = mdl.split("/")[-1]
+                        print(f"  콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/models/{mn}")
+                elif t == "RegisterModel":
+                    mp = meta.get("RegisterModel", {}).get("Arn")
+                    if mp:
+                        print("  ModelPackageArn:", mp)
+                        print(f"  콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/model-packages")
+            except Exception as e:
+                print("  [warn] detail fetch error:", e)
+
+            print()
+
+        # 실패 상태를 프로세스 코드로도 반영하려면 아래 유지
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
