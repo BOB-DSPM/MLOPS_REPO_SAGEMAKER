@@ -1,4 +1,4 @@
-# pipelines/pipeline_def.py (핵심 변경 포함 버전)
+# pipelines/pipeline_def.py (수정본)
 from __future__ import annotations
 import argparse
 import os
@@ -25,17 +25,20 @@ from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.workflow.functions import Join
 
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
     return v if v else default
 
+
 def _upload_code(local_path: str, bucket: str, key: str) -> str:
     """로컬 스크립트를 지정 버킷/키로 업로드하고 s3:// URI 반환."""
     s3 = boto3.client("s3")
     s3.upload_file(local_path, bucket, key)
     return f"s3://{bucket}/{key}"
+
 
 def get_pipeline(region: str, role_arn: str) -> Pipeline:
     boto_sess = boto3.Session(region_name=region)
@@ -59,18 +62,17 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     train_image = os.environ.get("TRAIN_IMAGE_URI", default_train_img)
 
     # ── ★ 기본 버킷 회피: 로컬 스크립트를 DataBucket/prefix 아래로 업로드(정적 문자열 URI 사용)
-    #     - CodeBuildRole 에게 이 버킷 PutObject 권한은 이미 있음
     data_bucket_str = env_or("DATA_BUCKET", "my-mlops-dev-data")
     prefix_str = env_or("PREFIX", "pipelines/exp1")
 
-    repo_root = Path(__file__).resolve().parent.parent  # 프로젝트 루트 기준 조정 필요시 바꾸세요
+    repo_root = Path(__file__).resolve().parent.parent  # 프로젝트 루트 기준
     local_extract = str(repo_root / "pipelines" / "processing" / "extract.py")
     local_evaluate = str(repo_root / "pipelines" / "processing" / "evaluate.py")
 
     extract_key = f"{prefix_str}/code/extract.py"
     evaluate_key = f"{prefix_str}/code/evaluate.py"
 
-    s3_code_extract = _upload_code(local_extract, data_bucket_str, extract_key)   # e.g. s3://my-mlops-dev-data/prefix/code/extract.py
+    s3_code_extract = _upload_code(local_extract, data_bucket_str, extract_key)   # s3://.../code/extract.py
     s3_code_evaluate = _upload_code(local_evaluate, data_bucket_str, evaluate_key)
 
     # ── Step 1: Extract (Processing)
@@ -86,7 +88,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_extract = ProcessingStep(
         name="Extract",
         processor=sklearn_proc,
-        code=s3_code_extract,  # ← 정적 문자열 S3 URI (파이프라인 변수 아님)
+        code=s3_code_extract,  # 정적 문자열 S3 URI
         job_arguments=[
             "--bucket", p_bucket,
             "--prefix", p_prefix,
@@ -167,7 +169,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_eval = ProcessingStep(
         name="Evaluate",
         processor=sklearn_proc,
-        code=s3_code_evaluate,  # ← 정적 문자열 S3 URI
+        code=s3_code_evaluate,  # 정적 문자열 S3 URI
         job_arguments=[
             "--validation-s3", val_s3,
             "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
@@ -178,13 +180,23 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
 
     # ── Step 6: Register
     mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
-    # 평가 json S3 경로는 런타임에 결정 → RegisterModel에서 ModelMetrics로 전달
+
+    # ⚠️ 파이프라인 변수는 문자열 더하기 불가 → Join 사용
+    eval_json_s3 = Join(
+        on="/",
+        values=[
+            step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
+            "evaluation.json",
+        ],
+    )
+
     model_metrics = ModelMetrics(
         model_statistics=MetricsSource(
-            s3_uri=step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json",
+            s3_uri=eval_json_s3,
             content_type="application/json",
         )
     )
+
     register_step = RegisterModel(
         name="RegisterModel",
         estimator=estimator,
