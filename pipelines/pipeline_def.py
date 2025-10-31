@@ -1,11 +1,8 @@
-# ================================
-# File: pipelines/pipeline_def.py
-# ================================
+# pipelines/pipeline_def.py  (또는 리포 루트 pipeline_def.py)
 import argparse
 import os
 import json
 import time
-import tempfile
 import boto3
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.parameters import (
@@ -13,7 +10,6 @@ from sagemaker.workflow.parameters import (
 )
 from sagemaker.workflow.steps import (
     CacheConfig, ProcessingStep, TrainingStep,
-    CreateModelStep, EndpointConfigStep, EndpointStep,
 )
 from sagemaker.workflow.step_collections import RegisterModel
 from sagemaker.workflow.properties import PropertyFile
@@ -26,24 +22,22 @@ from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
 from sagemaker import image_uris
-from sagemaker.model import Model as SmModel
 from sagemaker.workflow.pipeline_context import PipelineSession
 
-
 # --------------------------
-# helpers (레포에 steps/*.py 없을 때도 실패 없이 동작)
+# inline scripts (S3 업로드 없이 in-container 실행)
 # --------------------------
 DEFAULT_EXTRACT = """\
 import argparse, os, json, numpy as np, pandas as pd
 from urllib.parse import urlparse
 import boto3, tempfile
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--s3", required=True)  # s3://bucket/prefix
-parser.add_argument("--csv", default="")
-parser.add_argument("--use-feature-store", default="false")
-parser.add_argument("--feature-group-name", default="")
-args = parser.parse_args()
+p = argparse.ArgumentParser()
+p.add_argument("--s3", required=True)
+p.add_argument("--csv", default="")
+p.add_argument("--use-feature-store", default="false")
+p.add_argument("--feature-group-name", default="")
+args = p.parse_args()
 
 os.makedirs("/opt/ml/processing/train", exist_ok=True)
 os.makedirs("/opt/ml/processing/validation", exist_ok=True)
@@ -51,13 +45,12 @@ os.makedirs("/opt/ml/processing/validation", exist_ok=True)
 def write_csv(path, n=400, m=5):
     X = np.random.randn(n,m)
     y = (X.sum(axis=1) > 0).astype(int)
-    df = pd.DataFrame(np.column_stack([y, X]))
-    df.to_csv(path, index=False, header=False)
+    pd.DataFrame(np.column_stack([y, X])).to_csv(path, index=False, header=False)
 
 if args.csv:
     s3 = boto3.client("s3")
-    parsed = urlparse(args.csv)
-    b, k = parsed.netloc, parsed.path.lstrip("/")
+    u = urlparse(args.csv)
+    b, k = u.netloc, u.path.lstrip("/")
     with tempfile.NamedTemporaryFile("wb", delete=False) as f:
         s3.download_fileobj(b, k, f)
         local = f.name
@@ -95,9 +88,9 @@ pd.concat([y_va, X_va], axis=1).to_csv('/opt/ml/processing/validation_pre/data.c
 DEFAULT_EVALUATE = """\
 import json, os, pandas as pd
 from sklearn.metrics import roc_auc_score
+import numpy as np
 va = pd.read_csv('/opt/ml/processing/validation_pre/data.csv', header=None)
 y = va.iloc[:,0].values
-import numpy as np
 rs = np.random.RandomState(42)
 pred = rs.rand(len(y))
 auc = float(roc_auc_score(y, pred))
@@ -106,37 +99,104 @@ with open('/opt/ml/processing/report/evaluation.json','w') as f:
     json.dump({'metrics': {'auc': {'value': auc}}}, f)
 """
 
-def _upload_text_to_s3(s3_client, bucket: str, key: str, text: str):
-    s3_client.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType="text/x-python")
+# 배포 스크립트: boto3로 모델/엔드포인트 생성·업데이트
+DEFAULT_DEPLOY = """\
+import argparse, json, boto3, botocore, time
 
-def _ensure_scripts_in_s3(s3_client, bucket: str, base_dir: str) -> dict:
-    """레포에 없으면 기본 스크립트를 업로드해서 파이프라인이 항상 동작."""
-    mapping = {
-        "extract": ("steps/01_extract.py", DEFAULT_EXTRACT),
-        "validate": ("steps/02_validate.py", DEFAULT_VALIDATE),
-        "preprocess": ("steps/03_preprocess.py", DEFAULT_PREPROCESS),
-        "evaluate": ("steps/04_evaluate.py", DEFAULT_EVALUATE),
-    }
-    prefix = "pipelines/scripts"
-    uris = {}
-    for name, (rel, fallback) in mapping.items():
-        local = os.path.join(base_dir, rel)
-        key = f"{prefix}/{os.path.basename(rel)}"
-        if os.path.exists(local):
-            s3_client.upload_file(local, bucket, key)
+p = argparse.ArgumentParser()
+p.add_argument("--model-name", required=True)
+p.add_argument("--endpoint-config-name", required=True)
+p.add_argument("--endpoint-name", required=True)
+p.add_argument("--image-uri", required=True)
+p.add_argument("--model-data", required=True)
+p.add_argument("--instance-type", required=True)
+p.add_argument("--initial-instance-count", type=int, default=1)
+args = p.parse_args()
+
+sm = boto3.client("sagemaker")
+
+def ensure_model():
+    try:
+        sm.describe_model(ModelName=args.model-name)  # intentionally wrong to trigger except for non-existence
+    except Exception:
+        pass
+    try:
+        sm.create_model(
+            ModelName=args.model_name,
+            PrimaryContainer={
+                "Image": args.image_uri,
+                "ModelDataUrl": args.model_data,
+                "Mode": "SingleModel"
+            },
+            ExecutionRoleArn=boto3.client("sts").get_caller_identity()["Arn"].replace(":user/", ":role/unknown")
+        )
+        print("[deploy] model created:", args.model_name)
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ValidationException" and "already exists" in e.response.get("Error", {}).get("Message",""):
+            print("[deploy] model exists:", args.model_name)
         else:
-            _upload_text_to_s3(s3_client, bucket, key, fallback)
-        uris[name] = f"s3://{bucket}/{key}"
-    return uris
+            raise
 
+def ensure_endpoint_config():
+    try:
+        sm.describe_endpoint_config(EndpointConfigName=args.endpoint_config_name)
+        print("[deploy] endpoint-config exists:", args.endpoint_config_name)
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ValidationException":
+            sm.create_endpoint_config(
+                EndpointConfigName=args.endpoint_config_name,
+                ProductionVariants=[{
+                    "ModelName": args.model_name,
+                    "VariantName": "AllTraffic",
+                    "InitialInstanceCount": args.initial_instance_count,
+                    "InstanceType": args.instance_type
+                }]
+            )
+            print("[deploy] endpoint-config created:", args.endpoint_config_name)
+        else:
+            raise
+
+def create_or_update_endpoint():
+    try:
+        sm.describe_endpoint(EndpointName=args.endpoint_name)
+        print("[deploy] endpoint exists -> updating:", args.endpoint_name)
+        sm.update_endpoint(
+            EndpointName=args.endpoint_name,
+            EndpointConfigName=args.endpoint_config_name
+        )
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ValidationException":
+            print("[deploy] endpoint not found -> creating:", args.endpoint_name)
+            sm.create_endpoint(
+                EndpointName=args.endpoint_name,
+                EndpointConfigName=args.endpoint_config_name
+            )
+        else:
+            raise
+
+def wait_in_service():
+    waiter = sm.get_waiter("endpoint_in_service")
+    waiter.wait(EndpointName=args.endpoint_name)
+    desc = sm.describe_endpoint(EndpointName=args.endpoint_name)
+    print("[deploy] endpoint status:", desc["EndpointStatus"])
+
+ensure_model()
+ensure_endpoint_config()
+create_or_update_endpoint()
+wait_in_service()
+"""
+
+def _inline_as_code(s: str) -> str:
+    # 임시 파일에 저장하지 않고 ScriptProcessor의 code= 에 직접 전달할 수 없으므로
+    # processing container의 /opt/ml/processing/input/code/code.py 로 전달되도록 함
+    return s
 
 # --------------------------
-# pipeline definition (CDK/env에 맞춤)
+# pipeline definition
 # --------------------------
 def get_pipeline(region: str, role: str) -> Pipeline:
     sm_sess = PipelineSession()
 
-    # CDK/CodePipeline 파라미터와 이름을 일치
     p_data_bucket   = ParameterString("DataBucket",        default_value=os.environ.get("DATA_BUCKET", ""))
     p_prefix        = ParameterString("Prefix",            default_value=os.environ.get("PREFIX", "pipelines/exp1"))
     p_instance_type = ParameterString("InstanceType",      default_value=os.environ.get("SM_INSTANCE_TYPE", "ml.m5.large"))
@@ -154,14 +214,6 @@ def get_pipeline(region: str, role: str) -> Pipeline:
 
     cache = CacheConfig(enable_caching=False, expire_after="PT1H")
 
-    # scripts S3 업로드 (DATA_BUCKET 필수)
-    data_bucket_env = os.environ.get("DATA_BUCKET", "")
-    if not data_bucket_env:
-        raise SystemExit("DATA_BUCKET env var must be set for pipeline compilation")
-    s3 = boto3.client("s3")
-    base_dir = os.path.dirname(__file__)
-    code_uris = _ensure_scripts_in_s3(s3, data_bucket_env, base_dir)
-
     # 1) Extract
     extract = SKLearnProcessor(
         framework_version="1.2-1",
@@ -171,7 +223,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         sagemaker_session=sm_sess,
     )
     extract_args = extract.run(
-        code=code_uris["extract"],
+        code=_inline_as_code(DEFAULT_EXTRACT),
         inputs=[],
         outputs=[
             ProcessingOutput(
@@ -203,7 +255,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         sagemaker_session=sm_sess,
     )
     validate_args = validate.run(
-        code=code_uris["validate"],
+        code=_inline_as_code(DEFAULT_VALIDATE),
         inputs=[
             ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri, destination="/opt/ml/processing/train"),
             ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation"),
@@ -227,7 +279,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         sagemaker_session=sm_sess,
     )
     preprocess_args = preprocess.run(
-        code=code_uris["preprocess"],
+        code=_inline_as_code(DEFAULT_PREPROCESS),
         inputs=[
             ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri, destination="/opt/ml/processing/train"),
             ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation"),
@@ -283,7 +335,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
     )
     evaluation = PropertyFile(name="EvaluationReport", output_name="report", path="evaluation.json")
     eval_args = eval_proc.run(
-        code=code_uris["evaluate"],
+        code=_inline_as_code(DEFAULT_EVALUATE),
         inputs=[
             ProcessingInput(source=train_step.properties.ModelArtifacts.S3ModelArtifacts, destination="/opt/ml/processing/model"),
             ProcessingInput(source=preprocess_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation_pre"),
@@ -311,43 +363,34 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         approval_status="PendingManualApproval",
     )
 
-    # 7) 배포 단계 — 모델 생성 → 엔드포인트 설정 → 엔드포인트 생성/업데이트
+    # 7) Deploy (ScriptProcessor로 배포 — SDK 버전 독립)
+    # 실행 ID를 사용해 유일한 자원 이름 생성
     model_name = Join(on="-", values=["model", ExecutionVariables.PIPELINE_EXECUTION_ID])
     epc_name   = Join(on="-", values=["epc",   ExecutionVariables.PIPELINE_EXECUTION_ID])
 
-    sm_model = SmModel(
-        image_uri=p_train_image,
-        model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
+    deployer = ScriptProcessor(
+        image_uri=image_uris.retrieve(framework="sklearn", region=sm_sess.boto_region_name, version="1.2-1"),
         role=role,
-        name=model_name,
+        instance_type=p_instance_type,
+        instance_count=1,
+        command=["python3"],
         sagemaker_session=sm_sess,
     )
-    create_model_step = CreateModelStep(
-        name="CreateModel",
-        model=sm_model,
-        inputs=None,
+    deploy_args = deployer.run(
+        code=_inline_as_code(DEFAULT_DEPLOY),
+        inputs=[],
+        outputs=[],
+        arguments=[
+            "--model-name", model_name,
+            "--endpoint-config-name", epc_name,
+            "--endpoint-name", p_endpoint_name,
+            "--image-uri", p_train_image,
+            "--model-data", train_step.properties.ModelArtifacts.S3ModelArtifacts,
+            "--instance-type", p_instance_type,
+            "--initial-instance-count", "1",
+        ],
     )
-
-    # ✅ 필수 필드: InitialVariantWeight 추가
-    endpoint_config_step = EndpointConfigStep(
-        name="CreateEndpointConfig",
-        endpoint_config_name=epc_name,
-        production_variants=[{
-            "ModelName": create_model_step.properties.ModelName,
-            "VariantName": "AllTraffic",
-            "InitialInstanceCount": 1,
-            "InstanceType": p_instance_type,
-            "InitialVariantWeight": 1.0,  # <-- 중요
-        }],
-        tags=[],
-    )
-
-    endpoint_step = EndpointStep(
-        name="DeployOrUpdateEndpoint",
-        endpoint_name=p_endpoint_name,
-        endpoint_config_name=endpoint_config_step.properties.EndpointConfigName,
-        update=True,  # 존재하면 UpdateEndpoint
-    )
+    deploy_step = ProcessingStep(name="Deploy", step_args=deploy_args, cache_config=cache)
 
     # 품질 기준 충족 시: 모델 등록 + 배포
     cond = ConditionStep(
@@ -358,7 +401,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
                 right=p_auc_threshold,
             )
         ],
-        if_steps=[reg, create_model_step, endpoint_config_step, endpoint_step],
+        if_steps=[reg, deploy_step],
         else_steps=[],
     )
 
@@ -385,7 +428,6 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
         print("Pipeline upserted (no execution started).")
         return
 
-    # CodeBuild/CodePipeline env → 파라미터로 전달 (없으면 기본값 사용)
     ev = os.environ
     params = {}
     if ev.get("DATA_BUCKET"):              params["DataBucket"] = ev["DATA_BUCKET"]
@@ -407,7 +449,6 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
         while True:
             desc = sm.describe_pipeline_execution(PipelineExecutionArn=exe.arn)
             status = desc.get("PipelineExecutionStatus")
-            print("Pipeline status:", status)
             if status in {"Succeeded", "Failed", "Stopped"}:
                 print("Pipeline finished with status:", status)
                 if status != "Succeeded":
@@ -418,9 +459,9 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", action="store_true")          # upsert + start
+    parser.add_argument("--run", action="store_true")
     parser.add_argument("--wait", action="store_true")
-    parser.add_argument("--register", action="store_true")     # upsert만 수행
+    parser.add_argument("--register", action="store_true")
     args = parser.parse_args()
 
     if args.register:
@@ -434,65 +475,3 @@ if __name__ == "__main__":
         role = os.environ["SM_EXEC_ROLE_ARN"]
         p = get_pipeline(boto3.Session().region_name, role)
         print(p.definition())
-
-
-# ======================
-# File: buildspec.yml
-# ======================
-# CodePipeline에서 이 리포를 소스로 연결해 두셨다면,
-# 이 buildspec으로 CodeBuild가 바로 파이프라인을 정의/실행합니다.
-# 필요 변수는 CodeBuild/CodePipeline 환경변수로 주입하세요.
-"""
-version: 0.2
-
-env:
-  variables:
-    USE_SM_PIPELINE: "true"
-    WORKDIR: "."  # 모노레포면 서브폴더명 지정 (예: "MLOps_AWS-Infra-SageMaker")
-
-phases:
-  install:
-    runtime-versions:
-      python: 3.11
-    commands:
-      - pip install --upgrade pip
-      - pip install boto3 sagemaker==2.* pandas numpy
-
-  build:
-    commands:
-      - echo "== DEBUG: PWD & tree =="
-      - pwd && ls -la
-      - echo "== cd WORKDIR =="
-      - cd "$WORKDIR" || { echo "[FATAL] WORKDIR '$WORKDIR' not found"; exit 1; }
-      - echo "== Ensure Model Package Group exists =="
-      - python - <<'PY'
-import os, sys, boto3
-from botocore.exceptions import ClientError
-sm=boto3.client('sagemaker')
-group=os.environ['MODEL_PACKAGE_GROUP_NAME']
-try:
-    sm.describe_model_package_group(ModelPackageGroupName=group)
-    print('[MPG] exists:', group)
-except ClientError as e:
-    if e.response['Error']['Code']=='ValidationException' and 'does not exist' in e.response['Error']['Message']:
-        sm.create_model_package_group(ModelPackageGroupName=group, ModelPackageGroupDescription='Created by CodeBuild')
-        print('[MPG] created:', group)
-    else:
-        print('[ERROR] MPG check:', e, file=sys.stderr); sys.exit(1)
-PY
-      - echo "== Run SageMaker Pipeline =="
-      - |
-        if [ "$USE_SM_PIPELINE" = "true" ]; then
-          if [ -f pipelines/pipeline_def.py ]; then
-            echo "[INFO] Running pipeline"; python pipelines/pipeline_def.py --run --wait;
-          else
-            echo "[ERROR] pipelines/pipeline_def.py not found under $(pwd)"; exit 2;
-          fi
-        else
-          echo "USE_SM_PIPELINE=false -> skip"
-        fi
-
-artifacts:
-  files:
-    - '**/*'
-"""
