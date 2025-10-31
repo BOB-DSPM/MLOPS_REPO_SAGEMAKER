@@ -16,7 +16,6 @@ from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.transformer import Transformer
 
 from sagemaker.processing import ProcessingOutput
-from sagemaker.workflow.functions import Join
 from sagemaker.workflow.parameters import (
     ParameterString,
     ParameterInteger,
@@ -28,7 +27,7 @@ from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.step_collections import RegisterModel
-
+from sagemaker.workflow.functions import Join  # (Eval JSON 경로 조립에만 사용)
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
@@ -56,16 +55,6 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     default_train_img = image_uris.retrieve(region=region, framework="xgboost", version="1.7-1")
     train_image = os.environ.get("TRAIN_IMAGE_URI", default_train_img)
 
-    # ── ★ Code S3 URI (기본 버킷 생성 회피)
-    s3_code_extract = Join(
-        on="",
-        values=["s3://", p_bucket, "/", p_prefix, "/code/extract.py"],
-    )
-    s3_code_evaluate = Join(
-        on="",
-        values=["s3://", p_bucket, "/", p_prefix, "/code/evaluate.py"],
-    )
-
     # ── Step 1: Extract (Processing)
     sklearn_proc = SKLearnProcessor(
         framework_version="1.2-1",
@@ -79,7 +68,8 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_extract = ProcessingStep(
         name="Extract",
         processor=sklearn_proc,
-        code=s3_code_extract,  # ← 로컬 파일 대신 S3 URI
+        # ✅ 파이프라인 변수 대신 '로컬 파일 경로' 사용 (SDK가 S3로 업로드)
+        code="pipelines/processing/extract.py",
         job_arguments=[
             "--bucket", p_bucket,
             "--prefix", p_prefix,
@@ -146,7 +136,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         assemble_with="Line",
         strategy="SingleRecord",
         sagemaker_session=sm_sess,
-        output_path=None,
+        output_path=None,  # pipeline execution별 기본 S3 출력 경로 사용
     )
     step_transform = TransformStep(
         name="TransformValidation",
@@ -155,7 +145,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
             data=val_s3,
             content_type="text/csv",
             split_type="Line",
-            input_filter="$[1:]",
+            input_filter="$[1:]",  # 첫 컬럼(label) 제외
         ),
     )
 
@@ -164,7 +154,8 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_eval = ProcessingStep(
         name="Evaluate",
         processor=sklearn_proc,
-        code=s3_code_evaluate,  # ← 로컬 파일 대신 S3 URI
+        # ✅ 로컬 파일 경로 사용
+        code="pipelines/processing/evaluate.py",
         job_arguments=[
             "--validation-s3", val_s3,
             "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
@@ -176,7 +167,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     # ── Step 6: Register (Model Registry)
     mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
 
-    # 파이프라인 변수는 문자열 덧셈 금지 → Join 사용
+    # Eval 결과 JSON S3 경로 조립 (pipeline 변수끼리 문자열 덧셈 금지 → Join 사용)
     eval_json_s3 = Join(
         on="/",
         values=[
@@ -194,7 +185,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
 
     register_step = RegisterModel(
         name="RegisterModel",
-        estimator=estimator,
+        estimator=estimator,  # 이미지/환경 정의 상속 목적
         model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
         content_types=["text/csv"],
         response_types=["text/csv"],
