@@ -15,7 +15,7 @@
 - (옵션) `FEATURE_GROUP_NAME=...`
 
 ## 파이프라인 단계
-1) Extract → 2) Validate → 3) Preprocess → 4) Train → 5) Evaluate  
+1) Extract → 2) Validate → 3) Preprocess → 4) Train → 5) Evaluate  asdfasdf
 AUC ≥ 0.65면 6) Register + 7) Deploy(boto3) 수행
 
 ## 로컬 테스트
