@@ -1,7 +1,8 @@
-# pipelines/pipeline_def.py
+# ================================
+# File: pipelines/pipeline_def.py
+# ================================
 import argparse
 import os
-import io
 import json
 import time
 import tempfile
@@ -12,20 +13,20 @@ from sagemaker.workflow.parameters import (
 )
 from sagemaker.workflow.steps import (
     CacheConfig, ProcessingStep, TrainingStep,
-    CreateModelStep, EndpointConfigStep, EndpointStep,  # ✅ 배포 단계 추가
+    CreateModelStep, EndpointConfigStep, EndpointStep,
 )
 from sagemaker.workflow.step_collections import RegisterModel
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.functions import Join
 from sagemaker.workflow.condition_step import ConditionStep, JsonGet
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.execution_variables import ExecutionVariables  # ✅ 실행 ID 사용
+from sagemaker.workflow.execution_variables import ExecutionVariables
 from sagemaker.processing import ScriptProcessor, ProcessingInput, ProcessingOutput
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
 from sagemaker import image_uris
-from sagemaker.model import Model as SmModel  # ✅ CreateModelStep에 사용
+from sagemaker.model import Model as SmModel
 from sagemaker.workflow.pipeline_context import PipelineSession
 
 
@@ -54,7 +55,6 @@ def write_csv(path, n=400, m=5):
     df.to_csv(path, index=False, header=False)
 
 if args.csv:
-    import pandas as pd
     s3 = boto3.client("s3")
     parsed = urlparse(args.csv)
     b, k = parsed.netloc, parsed.path.lstrip("/")
@@ -140,7 +140,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
     p_data_bucket   = ParameterString("DataBucket",        default_value=os.environ.get("DATA_BUCKET", ""))
     p_prefix        = ParameterString("Prefix",            default_value=os.environ.get("PREFIX", "pipelines/exp1"))
     p_instance_type = ParameterString("InstanceType",      default_value=os.environ.get("SM_INSTANCE_TYPE", "ml.m5.large"))
-    p_endpoint_name = ParameterString("EndpointName",      default_value=os.environ.get("SM_ENDPOINT_NAME", "mlops-endpoint"))  # ✅ 추가
+    p_endpoint_name = ParameterString("EndpointName",      default_value=os.environ.get("SM_ENDPOINT_NAME", "mlops-endpoint"))
 
     default_train_image = image_uris.retrieve(framework="xgboost", region=sm_sess.boto_region_name, version="1.7-1")
     p_train_image  = ParameterString("TrainImage",         default_value=os.environ.get("TRAIN_IMAGE_URI", default_train_image))
@@ -311,8 +311,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         approval_status="PendingManualApproval",
     )
 
-    # 7) (신규) 배포 단계 — 모델 생성 → 엔드포인트 설정 → 엔드포인트 생성/업데이트
-    # 모델 이름/엔드포인트 컨피그 이름은 실행 ID와 조합하여 유일하게 생성
+    # 7) 배포 단계 — 모델 생성 → 엔드포인트 설정 → 엔드포인트 생성/업데이트
     model_name = Join(on="-", values=["model", ExecutionVariables.PIPELINE_EXECUTION_ID])
     epc_name   = Join(on="-", values=["epc",   ExecutionVariables.PIPELINE_EXECUTION_ID])
 
@@ -322,7 +321,6 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         role=role,
         name=model_name,
         sagemaker_session=sm_sess,
-        # (필요 시 env 추가 가능)
     )
     create_model_step = CreateModelStep(
         name="CreateModel",
@@ -330,6 +328,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
         inputs=None,
     )
 
+    # ✅ 필수 필드: InitialVariantWeight 추가
     endpoint_config_step = EndpointConfigStep(
         name="CreateEndpointConfig",
         endpoint_config_name=epc_name,
@@ -338,6 +337,7 @@ def get_pipeline(region: str, role: str) -> Pipeline:
             "VariantName": "AllTraffic",
             "InitialInstanceCount": 1,
             "InstanceType": p_instance_type,
+            "InitialVariantWeight": 1.0,  # <-- 중요
         }],
         tags=[],
     )
@@ -396,7 +396,7 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
     if ev.get("MODEL_PACKAGE_GROUP_NAME"): params["ModelPackageGroupName"] = ev["MODEL_PACKAGE_GROUP_NAME"]
     if ev.get("TRAIN_IMAGE_URI"):          params["TrainImage"] = ev["TRAIN_IMAGE_URI"]
     if ev.get("SM_INSTANCE_TYPE"):         params["InstanceType"] = ev["SM_INSTANCE_TYPE"]
-    if ev.get("SM_ENDPOINT_NAME"):         params["EndpointName"] = ev["SM_ENDPOINT_NAME"]  # ✅ 추가
+    if ev.get("SM_ENDPOINT_NAME"):         params["EndpointName"] = ev["SM_ENDPOINT_NAME"]
 
     exe = pipe.start(parameters=params if params else None)
     print("Started pipeline:", exe.arn)
@@ -407,6 +407,7 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
         while True:
             desc = sm.describe_pipeline_execution(PipelineExecutionArn=exe.arn)
             status = desc.get("PipelineExecutionStatus")
+            print("Pipeline status:", status)
             if status in {"Succeeded", "Failed", "Stopped"}:
                 print("Pipeline finished with status:", status)
                 if status != "Succeeded":
@@ -414,12 +415,12 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
                 break
             time.sleep(15)
 
- 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")          # upsert + start
     parser.add_argument("--wait", action="store_true")
-    parser.add_argument("--register", action="store_true")     # ✅ upsert만 수행
+    parser.add_argument("--register", action="store_true")     # upsert만 수행
     args = parser.parse_args()
 
     if args.register:
@@ -433,3 +434,65 @@ if __name__ == "__main__":
         role = os.environ["SM_EXEC_ROLE_ARN"]
         p = get_pipeline(boto3.Session().region_name, role)
         print(p.definition())
+
+
+# ======================
+# File: buildspec.yml
+# ======================
+# CodePipeline에서 이 리포를 소스로 연결해 두셨다면,
+# 이 buildspec으로 CodeBuild가 바로 파이프라인을 정의/실행합니다.
+# 필요 변수는 CodeBuild/CodePipeline 환경변수로 주입하세요.
+"""
+version: 0.2
+
+env:
+  variables:
+    USE_SM_PIPELINE: "true"
+    WORKDIR: "."  # 모노레포면 서브폴더명 지정 (예: "MLOps_AWS-Infra-SageMaker")
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install --upgrade pip
+      - pip install boto3 sagemaker==2.* pandas numpy
+
+  build:
+    commands:
+      - echo "== DEBUG: PWD & tree =="
+      - pwd && ls -la
+      - echo "== cd WORKDIR =="
+      - cd "$WORKDIR" || { echo "[FATAL] WORKDIR '$WORKDIR' not found"; exit 1; }
+      - echo "== Ensure Model Package Group exists =="
+      - python - <<'PY'
+import os, sys, boto3
+from botocore.exceptions import ClientError
+sm=boto3.client('sagemaker')
+group=os.environ['MODEL_PACKAGE_GROUP_NAME']
+try:
+    sm.describe_model_package_group(ModelPackageGroupName=group)
+    print('[MPG] exists:', group)
+except ClientError as e:
+    if e.response['Error']['Code']=='ValidationException' and 'does not exist' in e.response['Error']['Message']:
+        sm.create_model_package_group(ModelPackageGroupName=group, ModelPackageGroupDescription='Created by CodeBuild')
+        print('[MPG] created:', group)
+    else:
+        print('[ERROR] MPG check:', e, file=sys.stderr); sys.exit(1)
+PY
+      - echo "== Run SageMaker Pipeline =="
+      - |
+        if [ "$USE_SM_PIPELINE" = "true" ]; then
+          if [ -f pipelines/pipeline_def.py ]; then
+            echo "[INFO] Running pipeline"; python pipelines/pipeline_def.py --run --wait;
+          else
+            echo "[ERROR] pipelines/pipeline_def.py not found under $(pwd)"; exit 2;
+          fi
+        else
+          echo "USE_SM_PIPELINE=false -> skip"
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+"""
