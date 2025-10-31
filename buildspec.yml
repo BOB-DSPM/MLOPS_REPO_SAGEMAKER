@@ -33,6 +33,7 @@ phases:
         PY
       - echo "USE_SM_PIPELINE=$USE_SM_PIPELINE"
       - if [ "$USE_SM_PIPELINE" = "true" ]; then python pipelines/pipeline_def.py --run --wait; fi
+
 artifacts:
   files:
     - '**/*'
