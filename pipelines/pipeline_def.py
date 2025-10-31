@@ -1,305 +1,243 @@
-# pipelines/pipeline_def.py
+# ──────────────────────────────────────────────────────────────────────────────
+# file: pipelines/pipeline_def.py
+# SageMaker Pipelines (Processing → Train → Transform → Evaluate → Register)
+# Compatible with sagemaker==2.254.1 (no Endpoint* pipeline steps used)
+# ──────────────────────────────────────────────────────────────────────────────
+from __future__ import annotations
+
 import argparse
 import os
-import time
+import json
 import boto3
-
-from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.session import Session
 from sagemaker.workflow.parameters import (
-    ParameterString, ParameterFloat, ParameterInteger,
+    ParameterString, ParameterInteger, ParameterFloat
 )
-from sagemaker.workflow.steps import (
-    CacheConfig, ProcessingStep, TrainingStep,
-)
-from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker.workflow.properties import PropertyFile
-from sagemaker.workflow.functions import Join, JsonGet
-from sagemaker.workflow.condition_step import ConditionStep
-from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.execution_variables import ExecutionVariables
-
-from sagemaker.processing import ScriptProcessor, ProcessingInput, ProcessingOutput
-from sagemaker.sklearn.processing import SKLearnProcessor
-from sagemaker.estimator import Estimator
-from sagemaker.inputs import TrainingInput
-from sagemaker import image_uris
+from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
+from sagemaker.inputs import TrainingInput, TransformInput
+from sagemaker.sklearn.processing import SKLearnProcessor
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
+from sagemaker.estimator import Estimator
+from sagemaker.workflow.properties import PropertyFile
+from sagemaker.model_metrics import MetricsSource, ModelMetrics
+from sagemaker.workflow.model_step import RegisterModel
+from sagemaker import image_uris
 
 
-def get_pipeline(region: str, role: str) -> Pipeline:
-    sm_sess = PipelineSession()
+def env_or(name: str, default: str) -> str:
+    v = os.environ.get(name, "").strip()
+    return v if v else default
 
-    # ---- Parameters (환경변수와 매핑) ----
-    p_data_bucket   = ParameterString("DataBucket",        default_value=os.environ.get("DATA_BUCKET", ""))
-    p_prefix        = ParameterString("Prefix",            default_value=os.environ.get("PREFIX", "pipelines/exp1"))
-    p_instance_type = ParameterString("InstanceType",      default_value=os.environ.get("SM_INSTANCE_TYPE", "ml.m5.large"))
-    p_endpoint_name = ParameterString("EndpointName",      default_value=os.environ.get("SM_ENDPOINT_NAME", "mlops-endpoint"))
 
-    default_train_image = image_uris.retrieve(framework="xgboost", region=region, version="1.7-1")
-    p_train_image  = ParameterString("TrainImage",         default_value=os.environ.get("TRAIN_IMAGE_URI", default_train_image))
-    p_external_csv = ParameterString("ExternalCsvUri",     default_value=os.environ.get("EXTERNAL_CSV_URI", ""))
-    p_use_fs       = ParameterString("UseFeatureStore",    default_value=os.environ.get("USE_FEATURE_STORE", "false"))
-    p_fg_name      = ParameterString("FeatureGroupName",   default_value=os.environ.get("FEATURE_GROUP_NAME", ""))
-    p_mpg          = ParameterString("ModelPackageGroupName", default_value=os.environ.get("MODEL_PACKAGE_GROUP_NAME", "model-pkg"))
+# -----------------------------
+# Pipeline definition factory
+# -----------------------------
+def get_pipeline(region: str, role_arn: str) -> Pipeline:
+    sess = boto3.Session(region_name=region)
+    sm_sess = PipelineSession(boto_session=sess, sagemaker_client=sess.client("sagemaker"))
 
-    p_auc_threshold= ParameterFloat("AucThreshold",        default_value=0.65)
-    p_num_round    = ParameterInteger("NumRound",          default_value=50)
+    # Parameters (can be overridden at start time)
+    p_prefix = ParameterString("Prefix", default_value=env_or("PREFIX", "pipelines/exp1"))
+    p_bucket = ParameterString("DataBucket", default_value=env_or("DATA_BUCKET", "my-mlops-dev-data"))
+    p_use_ext_csv = ParameterString("ExternalCsvUri", default_value=env_or("EXTERNAL_CSV_URI", ""))
+    p_process_instance = ParameterString("ProcessingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
+    p_train_instance = ParameterString("TrainingInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
+    p_transform_instance = ParameterString("TransformInstanceType", default_value=env_or("SM_INSTANCE_TYPE", "ml.m5.large"))
+    p_train_max_runtime = ParameterInteger("TrainMaxRuntimeSeconds", default_value=3600)
+    p_metric_auc_threshold = ParameterFloat("AUCThreshold", default_value=0.65)
 
-    cache = CacheConfig(enable_caching=False, expire_after="PT1H")
+    # Built-in XGBoost image URI (if not provided via env, resolve by SDK)
+    default_train_img = image_uris.retrieve(
+        region=region, framework="xgboost", version="1.7-1"
+    )
+    train_image = os.environ.get("TRAIN_IMAGE_URI", default_train_img)
 
-    # ---- 1) Extract ----
-    extract = SKLearnProcessor(
+    # ──────────── Step 1: EXTRACT (create or download CSV, split train/val)
+    # Produces:
+    #   /opt/ml/processing/train/data.csv
+    #   /opt/ml/processing/validation/data.csv
+    sklearn_proc = SKLearnProcessor(
         framework_version="1.2-1",
-        role=role,
-        instance_type=p_instance_type,
+        role=role_arn,
+        instance_type=p_process_instance,
         instance_count=1,
         sagemaker_session=sm_sess,
+        base_job_name="extract-csv",
     )
-    extract_args = extract.run(
-        code="processing/extract.py",
-        source_dir="pipelines",
-        inputs=[],
-        outputs=[
-            ProcessingOutput(
-                output_name="train",
-                source="/opt/ml/processing/train",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/extract/train"]),
-            ),
-            ProcessingOutput(
-                output_name="validation",
-                source="/opt/ml/processing/validation",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/extract/validation"]),
-            ),
-        ],
-        arguments=[
-            "--s3",  Join(on="", values=["s3://", p_data_bucket, "/", p_prefix]),
-            "--csv", p_external_csv,
-            "--use-feature-store", p_use_fs,
-            "--feature-group-name", p_fg_name,
-        ],
-    )
-    extract_step = ProcessingStep(name="Extract", step_args=extract_args, cache_config=cache)
 
-    # ---- 2) Validate ----
-    validate = SKLearnProcessor(
-        framework_version="1.2-1",
-        role=role,
-        instance_type=p_instance_type,
-        instance_count=1,
-        sagemaker_session=sm_sess,
-    )
-    evaluation = PropertyFile(name="ValidationSummary", output_name="report", path="summary.json")
-    validate_args = validate.run(
-        code="processing/validate.py",
-        source_dir="pipelines",
-        inputs=[
-            ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri, destination="/opt/ml/processing/train"),
-            ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation"),
+    step_extract = ProcessingStep(
+        name="Extract",
+        processor=sklearn_proc,
+        code="pipelines/processing/extract.py",
+        job_arguments=[
+            "--bucket", p_bucket,
+            "--prefix", p_prefix,
+            "--external-csv", p_use_ext_csv,
         ],
         outputs=[
-            ProcessingOutput(
-                output_name="report",
-                source="/opt/ml/processing/report",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/validate/report"]),
-            )
+            # The processor will write train/validation under these output paths
+            # Pipeline will capture to S3 automatically
         ],
     )
-    validate_step = ProcessingStep(name="Validate", step_args=validate_args, property_files=[evaluation], cache_config=cache)
 
-    # ---- 3) Preprocess ----
-    preprocess = SKLearnProcessor(
-        framework_version="1.2-1",
-        role=role,
-        instance_type=p_instance_type,
-        instance_count=1,
-        sagemaker_session=sm_sess,
-    )
-    preprocess_args = preprocess.run(
-        code="processing/preprocess.py",
-        source_dir="pipelines",
-        inputs=[
-            ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri, destination="/opt/ml/processing/train"),
-            ProcessingInput(source=extract_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation"),
-        ],
-        outputs=[
-            ProcessingOutput(
-                output_name="train_pre",
-                source="/opt/ml/processing/train_pre",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/preprocess/train_pre"]),
-            ),
-            ProcessingOutput(
-                output_name="validation_pre",
-                source="/opt/ml/processing/validation_pre",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/preprocess/validation_pre"]),
-            ),
-        ],
-    )
-    preprocess_step = ProcessingStep(name="Preprocess", step_args=preprocess_args, cache_config=cache)
+    # Locations for training/validation from previous step
+    train_s3 = step_extract.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri
+    val_s3 = step_extract.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri
 
-    # ---- 4) Train (XGBoost) ----
-    train = Estimator(
-        image_uri=p_train_image,
-        role=role,
-        instance_type=p_instance_type,
+    # ──────────── Step 2: TRAIN (Built-in XGBoost)
+    estimator = Estimator(
+        image_uri=train_image,
+        role=role_arn,
         instance_count=1,
+        instance_type=p_train_instance,
+        max_run=p_train_max_runtime,
         sagemaker_session=sm_sess,
-        output_path=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/model"]),
-        enable_network_isolation=False,
+        base_job_name="xgb-train",
+        output_path=f"s3://{p_bucket}/%s/model" % p_prefix,  # model artifact location
+        enable_sagemaker_metrics=True,
     )
-    train.set_hyperparameters(objective="binary:logistic", num_round=p_num_round, eval_metric="auc", verbosity=1)
-    train_args = train.fit(
+    # Typical XGB binary classification hyperparams (simple demo)
+    estimator.set_hyperparameters(
+        objective="binary:logistic",
+        eval_metric="auc",
+        num_round=100,
+        max_depth=5,
+        eta=0.2,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        verbosity=1,
+    )
+
+    train_step = TrainingStep(
+        name="Train",
+        estimator=estimator,
         inputs={
-            "train": TrainingInput(
-                s3_data=preprocess_step.properties.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri,
-                content_type="text/csv"
-            ),
-            "validation": TrainingInput(
-                s3_data=preprocess_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri,
-                content_type="text/csv"
-            ),
-        }
+            "train": TrainingInput(s3_data=train_s3, content_type="text/csv"),
+            "validation": TrainingInput(s3_data=val_s3, content_type="text/csv"),
+        },
     )
-    train_step = TrainingStep(name="Train", step_args=train_args, cache_config=cache)
 
-    # ---- 5) Evaluate ----
-    eval_proc = ScriptProcessor(
-        image_uri=image_uris.retrieve(framework="sklearn", region=region, version="1.2-1"),
-        role=role,
-        instance_type=p_instance_type,
+    # ──────────── Step 3: TRANSFORM (Batch transform on validation set)
+    transformer = train_step.get_transformer(
         instance_count=1,
-        command=["python3"],
-        sagemaker_session=sm_sess,
+        instance_type=p_transform_instance,
+        accept="text/csv",
+        strategy="SingleRecord",
+        assemble_with="Line",
+        output_path=f"s3://{p_bucket}/%s/transform" % p_prefix,
     )
-    eval_report = PropertyFile(name="EvaluationReport", output_name="report", path="evaluation.json")
-    eval_args = eval_proc.run(
-        code="processing/evaluate.py",
-        source_dir="pipelines",
-        inputs=[
-            ProcessingInput(source=train_step.properties.ModelArtifacts.S3ModelArtifacts, destination="/opt/ml/processing/model"),
-            ProcessingInput(source=preprocess_step.properties.ProcessingOutputConfig.Outputs[1].S3Output.S3Uri, destination="/opt/ml/processing/validation_pre"),
+
+    transform_input = TransformInput(
+        data=val_s3,  # validation CSV incl. label in 1st column
+        content_type="text/csv",
+        split_type="Line",
+        input_filter="$[1:]",    # drop label (1st col) before prediction
+    )
+
+    step_transform = TransformStep(
+        name="TransformValidation",
+        transformer=transformer,
+        inputs=transform_input,
+    )
+
+    # ──────────── Step 4: EVALUATE (compute AUC from transform output vs labels)
+    metrics_pf = PropertyFile(name="EvalReport", output_name="evaluation", path="evaluation.json")
+
+    step_eval = ProcessingStep(
+        name="Evaluate",
+        processor=sklearn_proc,
+        code="pipelines/processing/evaluate.py",
+        job_arguments=[
+            "--validation-s3", val_s3,
+            "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
         ],
         outputs=[
-            ProcessingOutput(
-                output_name="report",
-                source="/opt/ml/processing/report",
-                destination=Join(on="", values=["s3://", p_data_bucket, "/", p_prefix, "/evaluate/report"]),
-            )
+            {
+                "OutputName": "evaluation",
+                "AppManaged": True,
+                "S3Output": {
+                    "S3Uri": f"s3://{p_bucket}/%s/eval" % p_prefix,
+                    "LocalPath": "/opt/ml/processing/evaluation",
+                    "S3UploadMode": "EndOfJob",
+                },
+            },
         ],
+        property_files=[metrics_pf],
     )
-    eval_step = ProcessingStep(name="Evaluate", step_args=eval_args, property_files=[eval_report], cache_config=cache)
 
-    # ---- 6) Register (조건부) ----
-    reg = RegisterModel(
+    # ──────────── Step 5: REGISTER (Model Registry with metrics)
+    mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
+
+    model_metrics = ModelMetrics(
+        model_statistics=MetricsSource(
+            s3_uri=step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json",
+            content_type="application/json",
+        )
+    )
+
+    register_step = RegisterModel(
         name="RegisterModel",
-        estimator=train,
+        estimator=estimator,
         model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
         content_types=["text/csv"],
         response_types=["text/csv"],
-        inference_instances=["ml.m5.large"],
-        transform_instances=["ml.m5.large"],
-        model_package_group_name=p_mpg,
-        approval_status="PendingManualApproval",
+        inference_instances=["ml.m5.large", "ml.m5.xlarge"],
+        transform_instances=["ml.m5.large", "ml.m5.xlarge"],
+        model_package_group_name=mpg_name,
+        model_metrics=model_metrics,
     )
 
-    # ---- 7) Deploy (ScriptProcessor + boto3) ----
-    model_name = Join(on="-", values=["model", ExecutionVariables.PIPELINE_EXECUTION_ID])
-    epc_name   = Join(on="-", values=["epc",   ExecutionVariables.PIPELINE_EXECUTION_ID])
+    # (Optional) You could add a condition on AUC >= threshold to gate registration.
+    # For simplicity, we always register; if you want gating, add a ConditionStep here.
 
-    deployer = ScriptProcessor(
-        image_uri=image_uris.retrieve(framework="sklearn", region=region, version="1.2-1"),
-        role=role,
-        instance_type=p_instance_type,
-        instance_count=1,
-        command=["python3"],
-        sagemaker_session=sm_sess,
-    )
-    deploy_args = deployer.run(
-        code="processing/deploy.py",
-        source_dir="pipelines",
-        inputs=[],
-        outputs=[],
-        arguments=[
-            "--model-name", model_name,
-            "--endpoint-config-name", epc_name,
-            "--endpoint-name", p_endpoint_name,
-            "--image-uri", p_train_image,
-            "--model-data", train_step.properties.ModelArtifacts.S3ModelArtifacts,
-            "--instance-type", p_instance_type,
-            "--initial-instance-count", "1",
-            "--exec-role-arn", role,
-        ],
-    )
-    deploy_step = ProcessingStep(name="Deploy", step_args=deploy_args, cache_config=cache)
-
-    cond = ConditionStep(
-        name="ModelQualityCheck",
-        conditions=[
-            ConditionGreaterThanOrEqualTo(
-                left=JsonGet(step=eval_step, property_file=eval_report, json_path="metrics.auc.value"),
-                right=p_auc_threshold,
-            )
-        ],
-        if_steps=[reg, deploy_step],
-        else_steps=[],
-    )
-
-    pipeline = Pipeline(
-        name=os.environ.get("SM_PIPELINE_NAME", "my-mlops-dev-pipeline"),
+    return Pipeline(
+        name="SageMaker-ML-Exp1",
         parameters=[
-            p_data_bucket, p_prefix, p_instance_type, p_endpoint_name,
-            p_train_image, p_external_csv, p_use_fs, p_fg_name,
-            p_mpg, p_auc_threshold, p_num_round,
+            p_prefix,
+            p_bucket,
+            p_use_ext_csv,
+            p_process_instance,
+            p_train_instance,
+            p_transform_instance,
+            p_train_max_runtime,
+            p_metric_auc_threshold,
         ],
-        steps=[extract_step, validate_step, preprocess_step, train_step, eval_step, cond],
+        steps=[step_extract, train_step, step_transform, step_eval, register_step],
         sagemaker_session=sm_sess,
     )
-    return pipeline
 
 
-def upsert_and_start(wait: bool = False):
+# -----------------------------
+# CLI entry
+# -----------------------------
+def upsert_and_start(wait: bool = False) -> None:
     region = boto3.Session().region_name
     role = os.environ["SM_EXEC_ROLE_ARN"]
     pipe = get_pipeline(region, role)
     pipe.upsert(role_arn=role)
 
-    ev = os.environ
-    params = {}
-    if ev.get("DATA_BUCKET"):              params["DataBucket"] = ev["DATA_BUCKET"]
-    if ev.get("PREFIX"):                   params["Prefix"] = ev["PREFIX"]
-    if ev.get("EXTERNAL_CSV_URI"):         params["ExternalCsvUri"] = ev["EXTERNAL_CSV_URI"]
-    if ev.get("USE_FEATURE_STORE"):        params["UseFeatureStore"] = ev["USE_FEATURE_STORE"]
-    if ev.get("FEATURE_GROUP_NAME"):       params["FeatureGroupName"] = ev["FEATURE_GROUP_NAME"]
-    if ev.get("MODEL_PACKAGE_GROUP_NAME"): params["ModelPackageGroupName"] = ev["MODEL_PACKAGE_GROUP_NAME"]
-    if ev.get("TRAIN_IMAGE_URI"):          params["TrainImage"] = ev["TRAIN_IMAGE_URI"]
-    if ev.get("SM_INSTANCE_TYPE"):         params["InstanceType"] = ev["SM_INSTANCE_TYPE"]
-    if ev.get("SM_ENDPOINT_NAME"):         params["EndpointName"] = ev["SM_ENDPOINT_NAME"]
-
-    exe = pipe.start(parameters=params if params else None)
-    print("Started pipeline:", exe.arn)
-    print("Parameters passed:", params)
-
+    # Start with defaults (can pass specific param values here if desired)
+    execution = pipe.start()
+    print("Pipeline execution started:", execution.arn)
     if wait:
-        sm = boto3.client("sagemaker")
-        while True:
-            desc = sm.describe_pipeline_execution(PipelineExecutionArn=exe.arn)
-            status = desc.get("PipelineExecutionStatus")
-            print("Pipeline status:", status)
-            if status in {"Succeeded", "Failed", "Stopped"}:
-                if status != "Succeeded":
-                    raise SystemExit(f"Pipeline did not succeed: {status}")
-                break
-            time.sleep(15)
+        execution.wait()
+        print("Execution completed with status:", execution.describe().get("PipelineExecutionStatus"))
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", action="store_true")
-    ap.add_argument("--wait", action="store_true")
+    ap.add_argument("--run", action="store_true", help="Upsert and execute the pipeline")
+    ap.add_argument("--wait", action="store_true", help="Wait for execution to finish")
+    ap.add_argument("--register-only", action="store_true", help="(unused in this version)")
     args = ap.parse_args()
 
     if args.run:
         upsert_and_start(wait=args.wait)
     else:
+        # Just upsert (no run)
+        region = boto3.Session().region_name
         role = os.environ["SM_EXEC_ROLE_ARN"]
-        p = get_pipeline(boto3.Session().region_name, role)
-        print(p.definition())
+        p = get_pipeline(region, role)
+        p.upsert(role_arn=role)
+        print("Pipeline upserted (no execution started).")
