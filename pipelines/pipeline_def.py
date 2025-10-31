@@ -117,8 +117,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     )
     step_create_model = ModelStep(
         name="CreateModel",
-        model=model,
-        inputs=None,  # 기본값(컨테이너 정의만)으로 충분
+        step_args=model.create(),   # ← create()가 CreateModel API 호출 파라미터를 반환
     )
 
     # ── Step 4: Transform (Batch inference on validation set)
