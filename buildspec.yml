@@ -1,0 +1,38 @@
+# buildspec.yml
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    USE_SM_PIPELINE: "true"
+
+phases:
+  install:
+    commands:
+      - pip install --upgrade pip
+      - pip install boto3 sagemaker==2.* pandas numpy
+  build:
+    commands:
+      - echo 'Ensure Model Package Group exists...'
+      - |
+        python - <<'PY'
+        import os, sys, boto3
+        from botocore.exceptions import ClientError
+        sm=boto3.client('sagemaker')
+        group=os.environ['MODEL_PACKAGE_GROUP_NAME']
+        try:
+            sm.describe_model_package_group(ModelPackageGroupName=group)
+            print('[MPG] exists:', group)
+        except ClientError as e:
+            if e.response['Error']['Code']=='ValidationException' and 'does not exist' in e.response['Error']['Message']:
+                sm.create_model_package_group(ModelPackageGroupName=group, ModelPackageGroupDescription='Created by CodeBuild')
+                print('[MPG] created:', group)
+            else:
+                print('[ERROR] MPG check:', e, file=sys.stderr)
+                sys.exit(1)
+        PY
+      - echo "USE_SM_PIPELINE=$USE_SM_PIPELINE"
+      - if [ "$USE_SM_PIPELINE" = "true" ]; then python pipelines/pipeline_def.py --run --wait; fi
+artifacts:
+  files:
+    - '**/*'
