@@ -1,33 +1,42 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# file: pipelines/pipeline_def.py  (sagemaker==2.254.1)
+# file: pipelines/pipeline_def.py
 # Flow: Extract(Processing) → Train → CreateModel → Transform → Evaluate → Register
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 import argparse, os, boto3
-from sagemaker.workflow.parameters import ParameterString, ParameterInteger, ParameterFloat
+
+from sagemaker.workflow.parameters import (
+    ParameterString, ParameterInteger, ParameterFloat
+)
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.inputs import TrainingInput, TransformInput
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.processing import ProcessingOutput
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
-from sagemaker.workflow.model_step import ModelStep            # ✅ CreateModel step
-from sagemaker.transformer import Transformer                  # ✅ Batch transformer
+from sagemaker.workflow.model_step import ModelStep
+from sagemaker.model import Model
+from sagemaker.transformer import Transformer
 from sagemaker.estimator import Estimator
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.workflow.step_collections import RegisterModel  # ✅ RegisterModel import 위치
+from sagemaker.workflow.step_collections import RegisterModel
 from sagemaker import image_uris
+
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
     return v if v else default
 
+
 def get_pipeline(region: str, role_arn: str) -> Pipeline:
     boto_sess = boto3.Session(region_name=region)
-    sm_sess = PipelineSession(boto_session=boto_sess, sagemaker_client=boto_sess.client("sagemaker"))
+    sm_sess = PipelineSession(
+        boto_session=boto_sess,
+        sagemaker_client=boto_sess.client("sagemaker"),
+    )
 
-    # Parameters
+    # ── Parameters
     p_prefix = ParameterString("Prefix", default_value=env_or("PREFIX", "pipelines/exp1"))
     p_bucket = ParameterString("DataBucket", default_value=env_or("DATA_BUCKET", "my-mlops-dev-data"))
     p_use_ext_csv = ParameterString("ExternalCsvUri", default_value=env_or("EXTERNAL_CSV_URI", ""))
@@ -37,11 +46,11 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     p_train_max_runtime = ParameterInteger("TrainMaxRuntimeSeconds", default_value=3600)
     p_metric_auc_threshold = ParameterFloat("AUCThreshold", default_value=0.65)
 
-    # Training image (XGBoost)
+    # ── Training image (XGBoost)
     default_train_img = image_uris.retrieve(region=region, framework="xgboost", version="1.7-1")
     train_image = os.environ.get("TRAIN_IMAGE_URI", default_train_img)
 
-    # ── Step 1: Extract
+    # ── Step 1: Extract (Processing)
     sklearn_proc = SKLearnProcessor(
         framework_version="1.2-1",
         role=role_arn,
@@ -54,7 +63,11 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         name="Extract",
         processor=sklearn_proc,
         code="pipelines/processing/extract.py",
-        job_arguments=["--bucket", p_bucket, "--prefix", p_prefix, "--external-csv", p_use_ext_csv],
+        job_arguments=[
+            "--bucket", p_bucket,
+            "--prefix", p_prefix,
+            "--external-csv", p_use_ext_csv
+        ],
         outputs=[
             ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
             ProcessingOutput(output_name="validation", source="/opt/ml/processing/validation"),
@@ -78,7 +91,11 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         objective="binary:logistic",
         eval_metric="auc",
         num_round=100,
-        max_depth=5, eta=0.2, subsample=0.8, colsample_bytree=0.8, verbosity=1,
+        max_depth=5,
+        eta=0.2,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        verbosity=1,
     )
     train_step = TrainingStep(
         name="Train",
@@ -89,24 +106,31 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         },
     )
 
-    # ── Step 3: CreateModel (필수) → Transform 에서 참조
-    model = estimator.create_model()  # image_uri/role 등은 estimator에서 승계
+    # ── Step 3: CreateModel
+    # ⚠️ 파이프라인 컴파일 시점에는 학습 미완료 → Estimator.create_model() 금지
+    #    대신 Train step 산출물(S3 model artifacts)을 참조해 Model을 직접 생성
+    model = Model(
+        image_uri=train_image,
+        model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,  # ✅ runtime에 채워짐
+        role=role_arn,
+        sagemaker_session=sm_sess,
+    )
     step_create_model = ModelStep(
         name="CreateModel",
         model=model,
-        inputs=None,  # 기본값 사용
+        inputs=None,  # 기본값(컨테이너 정의만)으로 충분
     )
 
-    # ── Step 4: Transform (validation에 대한 batch inference)
+    # ── Step 4: Transform (Batch inference on validation set)
     transformer = Transformer(
-        model_name=step_create_model.properties.ModelName,   # ✅ CreateModel 결과 사용
+        model_name=step_create_model.properties.ModelName,  # ✅ CreateModel 결과 사용
         instance_count=1,
         instance_type=p_transform_instance,
         accept="text/csv",
         assemble_with="Line",
         strategy="SingleRecord",
         sagemaker_session=sm_sess,
-        output_path=None,  # 기본 S3 출력 경로 사용
+        output_path=None,  # 기본 S3 아웃 경로 사용(pipeline execution별 자동)
     )
     step_transform = TransformStep(
         name="TransformValidation",
@@ -143,7 +167,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     )
     register_step = RegisterModel(
         name="RegisterModel",
-        estimator=estimator,
+        estimator=estimator,  # 설명/호환 목적(이미지/환경 정의 상속)
         model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
         content_types=["text/csv"],
         response_types=["text/csv"],
@@ -158,11 +182,12 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         parameters=[
             p_prefix, p_bucket, p_use_ext_csv,
             p_process_instance, p_train_instance, p_transform_instance,
-            p_train_max_runtime, p_metric_auc_threshold
+            p_train_max_runtime, p_metric_auc_threshold,
         ],
         steps=[step_extract, train_step, step_create_model, step_transform, step_eval, register_step],
         sagemaker_session=sm_sess,
     )
+
 
 def upsert_and_start(wait: bool = False) -> None:
     region = boto3.Session().region_name
@@ -174,6 +199,7 @@ def upsert_and_start(wait: bool = False) -> None:
     if wait:
         exe.wait()
         print("Execution completed:", exe.describe().get("PipelineExecutionStatus"))
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
