@@ -414,7 +414,7 @@ def upsert_and_start(wait: bool = False, register_only: bool = False):
                 break
             time.sleep(15)
 
-
+ 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")          # upsert + start
