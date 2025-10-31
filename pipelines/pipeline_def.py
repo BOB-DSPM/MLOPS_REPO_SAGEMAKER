@@ -1,11 +1,9 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# file: pipelines/pipeline_def.py
-# Flow: Extract(Processing) → Train → CreateModel → Transform → Evaluate → Register
-# ──────────────────────────────────────────────────────────────────────────────
+# pipelines/pipeline_def.py (핵심 변경 포함 버전)
 from __future__ import annotations
 import argparse
 import os
 import boto3
+from pathlib import Path
 
 from sagemaker import image_uris
 from sagemaker.estimator import Estimator
@@ -27,12 +25,17 @@ from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker.workflow.functions import Join  # (Eval JSON 경로 조립에만 사용)
+
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
     return v if v else default
 
+def _upload_code(local_path: str, bucket: str, key: str) -> str:
+    """로컬 스크립트를 지정 버킷/키로 업로드하고 s3:// URI 반환."""
+    s3 = boto3.client("s3")
+    s3.upload_file(local_path, bucket, key)
+    return f"s3://{bucket}/{key}"
 
 def get_pipeline(region: str, role_arn: str) -> Pipeline:
     boto_sess = boto3.Session(region_name=region)
@@ -41,7 +44,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         sagemaker_client=boto_sess.client("sagemaker"),
     )
 
-    # ── Parameters
+    # ── Parameters (실행 시점 변경 가능한 파라미터)
     p_prefix = ParameterString("Prefix", default_value=env_or("PREFIX", "pipelines/exp1"))
     p_bucket = ParameterString("DataBucket", default_value=env_or("DATA_BUCKET", "my-mlops-dev-data"))
     p_use_ext_csv = ParameterString("ExternalCsvUri", default_value=env_or("EXTERNAL_CSV_URI", ""))
@@ -54,6 +57,21 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     # ── Training image (XGBoost)
     default_train_img = image_uris.retrieve(region=region, framework="xgboost", version="1.7-1")
     train_image = os.environ.get("TRAIN_IMAGE_URI", default_train_img)
+
+    # ── ★ 기본 버킷 회피: 로컬 스크립트를 DataBucket/prefix 아래로 업로드(정적 문자열 URI 사용)
+    #     - CodeBuildRole 에게 이 버킷 PutObject 권한은 이미 있음
+    data_bucket_str = env_or("DATA_BUCKET", "my-mlops-dev-data")
+    prefix_str = env_or("PREFIX", "pipelines/exp1")
+
+    repo_root = Path(__file__).resolve().parent.parent  # 프로젝트 루트 기준 조정 필요시 바꾸세요
+    local_extract = str(repo_root / "pipelines" / "processing" / "extract.py")
+    local_evaluate = str(repo_root / "pipelines" / "processing" / "evaluate.py")
+
+    extract_key = f"{prefix_str}/code/extract.py"
+    evaluate_key = f"{prefix_str}/code/evaluate.py"
+
+    s3_code_extract = _upload_code(local_extract, data_bucket_str, extract_key)   # e.g. s3://my-mlops-dev-data/prefix/code/extract.py
+    s3_code_evaluate = _upload_code(local_evaluate, data_bucket_str, evaluate_key)
 
     # ── Step 1: Extract (Processing)
     sklearn_proc = SKLearnProcessor(
@@ -68,8 +86,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_extract = ProcessingStep(
         name="Extract",
         processor=sklearn_proc,
-        # ✅ 파이프라인 변수 대신 '로컬 파일 경로' 사용 (SDK가 S3로 업로드)
-        code="pipelines/processing/extract.py",
+        code=s3_code_extract,  # ← 정적 문자열 S3 URI (파이프라인 변수 아님)
         job_arguments=[
             "--bucket", p_bucket,
             "--prefix", p_prefix,
@@ -121,13 +138,9 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         role=role_arn,
         sagemaker_session=sm_sess,
     )
+    step_create_model = ModelStep(name="CreateModel", step_args=model.create())
 
-    step_create_model = ModelStep(
-        name="CreateModel",
-        step_args=model.create(),
-    )
-
-    # ── Step 4: Transform (Batch inference on validation set)
+    # ── Step 4: Transform
     transformer = Transformer(
         model_name=step_create_model.properties.ModelName,
         instance_count=1,
@@ -136,7 +149,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         assemble_with="Line",
         strategy="SingleRecord",
         sagemaker_session=sm_sess,
-        output_path=None,  # pipeline execution별 기본 S3 출력 경로 사용
+        output_path=None,
     )
     step_transform = TransformStep(
         name="TransformValidation",
@@ -145,7 +158,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
             data=val_s3,
             content_type="text/csv",
             split_type="Line",
-            input_filter="$[1:]",  # 첫 컬럼(label) 제외
+            input_filter="$[1:]",
         ),
     )
 
@@ -154,8 +167,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     step_eval = ProcessingStep(
         name="Evaluate",
         processor=sklearn_proc,
-        # ✅ 로컬 파일 경로 사용
-        code="pipelines/processing/evaluate.py",
+        code=s3_code_evaluate,  # ← 정적 문자열 S3 URI
         job_arguments=[
             "--validation-s3", val_s3,
             "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
@@ -164,28 +176,18 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         property_files=[metrics_pf],
     )
 
-    # ── Step 6: Register (Model Registry)
+    # ── Step 6: Register
     mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
-
-    # Eval 결과 JSON S3 경로 조립 (pipeline 변수끼리 문자열 덧셈 금지 → Join 사용)
-    eval_json_s3 = Join(
-        on="/",
-        values=[
-            step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
-            "evaluation.json",
-        ],
-    )
-
+    # 평가 json S3 경로는 런타임에 결정 → RegisterModel에서 ModelMetrics로 전달
     model_metrics = ModelMetrics(
         model_statistics=MetricsSource(
-            s3_uri=eval_json_s3,
+            s3_uri=step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json",
             content_type="application/json",
         )
     )
-
     register_step = RegisterModel(
         name="RegisterModel",
-        estimator=estimator,  # 이미지/환경 정의 상속 목적
+        estimator=estimator,
         model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
         content_types=["text/csv"],
         response_types=["text/csv"],
