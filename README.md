@@ -22,4 +22,4 @@ AUC ≥ 0.65면 6) Register + 7) Deploy(boto3) 수행
 ```bash
 export SM_EXEC_ROLE_ARN=arn:aws:iam::<ACCOUNT_ID>:role/<SageMakerExecutionRole>
 python pipelines/pipeline_def.py --run --wait
-asdasdasd
+asdasdasdasdas
