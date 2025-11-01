@@ -25,6 +25,7 @@ from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.workflow.functions import Join  # ★ PipelineVariable 결합용
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
@@ -105,6 +106,10 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
     train_s3 = step_extract.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri
     val_s3   = step_extract.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri
 
+    # ★ PipelineVariable에 리터럴을 붙일 땐 문자열 포매팅 금지 → Join 사용
+    train_s3_file = Join(on="", values=[train_s3, "/data.csv"])
+    val_s3_file   = Join(on="", values=[val_s3,   "/data.csv"])
+
     # ── Step 2: Train (★ output_path를 “정적 문자열”로 강제 지정)
     estimator = Estimator(
         image_uri=train_image,
@@ -136,8 +141,8 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         estimator=estimator,
         inputs={
             # ★ processing 산출 파일(data.csv)로 직접 지정 + 명시적 File 모드
-            "train": TrainingInput(s3_data=f"{train_s3}/data.csv", content_type="text/csv", input_mode="File"),
-            "validation": TrainingInput(s3_data=f"{val_s3}/data.csv", content_type="text/csv", input_mode="File"),
+            "train": TrainingInput(s3_data=train_s3_file, content_type="text/csv", input_mode="File"),
+            "validation": TrainingInput(s3_data=val_s3_file, content_type="text/csv", input_mode="File"),
         },
     )
 
@@ -165,11 +170,11 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         name="TransformValidation",
         transformer=transformer,
         inputs=TransformInput(
-            # ★ validation data.csv만 변환
-            data=f"{val_s3}/data.csv",
+            # ★ validation 파일 경로도 Join 사용
+            data=val_s3_file,
             content_type="text/csv",
             split_type="Line",
-            input_filter="$[1:]",  # 첫 컬럼(라벨) 제외
+            input_filter="$[1:]",  # 첫 컬럼(라벨) 제외 (필요 시 유지)
         ),
     )
 
@@ -180,14 +185,14 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         processor=sklearn_proc,
         code=s3_code_evaluate,
         job_arguments=[
-            "--validation-s3", val_s3,
+            "--validation-s3", val_s3,  # evaluate.py가 단일 파일을 요구하면 val_s3_file로 교체
             "--pred-s3", step_transform.properties.TransformOutput.S3OutputPath,
         ],
         outputs=[ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation", destination=s3_eval_out)],
         property_files=[metrics_pf],
     )
 
-    # ── Step 6: Register (파이프라인 변수 + 문자열 연결 대신, 평가 파일 경로도 정적 규칙)
+    # ── Step 6: Register (평가 파일 경로 정적 규칙)
     mpg_name = env_or("MODEL_PACKAGE_GROUP_NAME", "my-mlops-dev-pkg")
     eval_json_uri = f"{s3_eval_out}/evaluation.json"
     model_metrics = ModelMetrics(
