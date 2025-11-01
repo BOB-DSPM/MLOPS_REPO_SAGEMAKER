@@ -25,21 +25,16 @@ from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.step_collections import RegisterModel
-# from sagemaker.workflow.functions import Join  # <- 더 이상 사용 안함
-# from sagemaker.workflow.execution_variables import ExecutionVariables  # <- 사용 안함
-
 
 def env_or(name: str, default: str) -> str:
     v = os.environ.get(name, "").strip()
     return v if v else default
-
 
 def _upload_code(local_path: str, bucket: str, key: str) -> str:
     """로컬 스크립트를 지정 버킷/키로 업로드하고 s3:// URI 반환."""
     s3 = boto3.client("s3")
     s3.upload_file(local_path, bucket, key)
     return f"s3://{bucket}/{key}"
-
 
 def get_pipeline(region: str, role_arn: str) -> Pipeline:
     boto_sess = boto3.Session(region_name=region)
@@ -131,14 +126,18 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         subsample=0.8,
         colsample_bytree=0.8,
         verbosity=1,
+        # ★ CSV/라벨 지정
+        label_column=0,
+        delimiter=",",
     )
 
     train_step = TrainingStep(
         name="Train",
         estimator=estimator,
         inputs={
-            "train": TrainingInput(s3_data=train_s3, content_type="text/csv"),
-            "validation": TrainingInput(s3_data=val_s3, content_type="text/csv"),
+            # ★ processing 산출 파일(data.csv)로 직접 지정 + 명시적 File 모드
+            "train": TrainingInput(s3_data=f"{train_s3}/data.csv", content_type="text/csv", input_mode="File"),
+            "validation": TrainingInput(s3_data=f"{val_s3}/data.csv", content_type="text/csv", input_mode="File"),
         },
     )
 
@@ -166,10 +165,11 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         name="TransformValidation",
         transformer=transformer,
         inputs=TransformInput(
-            data=val_s3,
+            # ★ validation data.csv만 변환
+            data=f"{val_s3}/data.csv",
             content_type="text/csv",
             split_type="Line",
-            input_filter="$[1:]",
+            input_filter="$[1:]",  # 첫 컬럼(라벨) 제외
         ),
     )
 
@@ -218,7 +218,6 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         steps=[step_extract, train_step, step_create_model, step_transform, step_eval, register_step],
         sagemaker_session=sm_sess,
     )
-
 
 def upsert_and_start(wait: bool = False) -> None:
     import time, json
@@ -312,7 +311,6 @@ def upsert_and_start(wait: bool = False) -> None:
 
             print()
 
-        # 실패 상태를 프로세스 코드로도 반영하려면 아래 유지
         raise SystemExit(1)
 
 if __name__ == "__main__":
