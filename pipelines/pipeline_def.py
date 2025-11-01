@@ -131,9 +131,7 @@ def get_pipeline(region: str, role_arn: str) -> Pipeline:
         subsample=0.8,
         colsample_bytree=0.8,
         verbosity=1,
-        # ★ CSV/라벨 지정
-        label_column=0,
-        delimiter=",",
+
     )
 
     train_step = TrainingStep(
