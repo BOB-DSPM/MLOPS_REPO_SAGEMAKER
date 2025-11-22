@@ -20,6 +20,7 @@ from urllib.parse import urlparse, unquote
 
 import boto3
 import pandas as pd
+import numpy as np
 
 
 # ---------------------------
@@ -68,6 +69,24 @@ RAW_HEADER = [
     "time_of_day",
     "clicked",  # label (raw last col)
 ]
+
+def make_synthetic(n: int = 200) -> pd.DataFrame:
+    """Fallback 데이터 생성용. 외부 CSV가 없을 때 파이프라인이 실패하지 않도록 최소 샘플을 만든다."""
+    rng = np.random.default_rng(42)
+    df = pd.DataFrame(
+        {
+            "user_id": np.arange(1, n + 1),
+            "user_name": [f"user_{i}" for i in range(1, n + 1)],
+            "age": rng.integers(18, 70, size=n),
+            "gender": rng.choice(["M", "F"], size=n),
+            "device": rng.choice(["ios", "android", "web"], size=n),
+            "position": rng.choice(["top", "middle", "bottom"], size=n),
+            "category": rng.choice(["sports", "finance", "news", "games"], size=n),
+            "time_of_day": rng.choice(["morning", "afternoon", "evening"], size=n),
+            "clicked": rng.choice([0, 1], size=n, p=[0.8, 0.2]),
+        }
+    )
+    return df
 
 
 def to_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
@@ -165,14 +184,22 @@ def main() -> None:
     s3 = boto3.client("s3", region_name=region)
 
     # Load raw
-    logging.info(f"Loading source CSV: {args.external_csv}")
-    if args.external_csv.startswith("s3://"):
-        bucket, key = parse_s3_uri(args.external_csv)
-        s3_head_object(s3, bucket, key)
-        raw = s3_read_csv_no_header(s3, bucket, key)
+    if not args.external_csv.strip():
+        logging.warning("No --external-csv provided. Generating synthetic dataset (200 rows).")
+        raw = make_synthetic()
     else:
-        # Local file support for offline testing
-        raw = pd.read_csv(args.external_csv, header=None)
+        logging.info(f"Loading source CSV: {args.external_csv}")
+        if args.external_csv.startswith("s3://"):
+            bucket, key = parse_s3_uri(args.external_csv)
+            try:
+                s3_head_object(s3, bucket, key)
+            except Exception as e:
+                logging.exception(f"S3 object not found: {args.external_csv}")
+                raise
+            raw = s3_read_csv_no_header(s3, bucket, key)
+        else:
+            # Local file support for offline testing
+            raw = pd.read_csv(args.external_csv, header=None)
 
     # Assign header and validate shape
     raw.columns = RAW_HEADER
