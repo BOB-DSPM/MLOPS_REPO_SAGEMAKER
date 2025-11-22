@@ -4,6 +4,7 @@ import argparse
 import os
 import boto3
 from pathlib import Path
+from botocore.exceptions import ClientError
 
 from sagemaker import image_uris
 from sagemaker.estimator import Estimator
@@ -244,7 +245,13 @@ def upsert_and_start(wait: bool = False) -> None:
         return sm.describe_pipeline_execution(PipelineExecutionArn=arn)
 
     def _list_steps():
-        return sm.list_pipeline_execution_steps(PipelineExecutionArn=arn, SortOrder="Ascending")
+        try:
+            return sm.list_pipeline_execution_steps(PipelineExecutionArn=arn, SortOrder="Ascending")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "AccessDeniedException":
+                print("  [warn] missing permission: sagemaker:ListPipelineExecutionSteps (skipping step diagnostics)")
+                return {}
+            raise
 
     # 대기 루프
     while True:
