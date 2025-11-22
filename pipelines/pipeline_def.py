@@ -261,6 +261,11 @@ def upsert_and_start(wait: bool = False) -> None:
             time.sleep(20)
             continue
         print("[status]", st)
+        if st == "Failed":
+            fr = d.get("FailureReason")
+            if fr:
+                print("FailureReason:", fr)
+            print(f"[open] 콘솔: https://{region}.console.aws.amazon.com/sagemaker/home?region={region}#/pipelines/execute/{arn}")
         if st == "Succeeded":
             print("Execution completed: Succeeded")
             return
